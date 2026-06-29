@@ -2,8 +2,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://c3.blckrbbt.io/:path*",
-      "comment": "Phase C of C3-56: point at Vercel-hosted public API"
+      "destination": "https://c3.blckrbbt.io/:path*"
     }
   ],
   "headers": [
