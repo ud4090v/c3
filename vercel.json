@@ -2,7 +2,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://c3.blckrbbt.io/:path*"
+      "destination": "https://c3.blckrbbt.io/api/:path*"
     }
   ],
   "headers": [
