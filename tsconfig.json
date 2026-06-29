@@ -13,7 +13,7 @@
     "isolatedModules": true,
     "noEmit": true,
     "paths": {
-      "@c3/shared": ["../../shared/src"]
+      "@c3/shared": ["./packages/shared/src"]
     }
   },
   "include": ["src"]
