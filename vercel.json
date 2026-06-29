@@ -1,0 +1,19 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://api.blckrbbt.io/:path*"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/:path*",
+      "headers": [
+        {
+          "key": "X-C3-Rewrite-Source",
+          "value": "vercel-public-ui"
+        }
+      ]
+    }
+  ]
+}
