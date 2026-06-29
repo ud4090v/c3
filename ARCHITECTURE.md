@@ -1,216 +1,281 @@
-# C3 — Command & Control Center
+# C3 — Three-Layer Architecture (Canonical Reference)
 
-## What C3 Is
+**Status:** live. **Authoritative.** If you find this contradicts a session's ad-hoc decisions, this file wins.
 
-C3 is the **single pane of glass** for BlackRabbitGroup's AI agent org. It surfaces:
-
-- **Agent roster and status** — who's online, who's busy, who's degraded (live data from OpenClaw sessions).
-- **Task board** — every task created, assigned, in-progress, completed, failed. Department-aware routing.
-- **Audit log** — every inter-agent message and tool invocation, queryable and paginated.
-- **Notifications** — in-app alert system for high-priority events.
-- **Analytics** — department throughput, agent leaderboards, health summary.
-- **Vault browser** — read-only view of `/root/.openclaw/vault/` for live OpenClaw memory and notes.
-- **Org chart** — visual hierarchy of departments → positions → agents.
-
-C3 is **not** an agent orchestration engine. C3 is the **observability and operator UI** for an org that already runs through OpenClaw. Commands that need to mutate agent state go through the OpenClaw add-on (HMAC-signed HTTP), not C3.
+This document is the single source of architectural truth for the C3 system. It supersedes per-session memory notes and per-issue Plane descriptions. Update here when the design changes.
 
 ---
 
-## Architecture (post-productization, Phase 1+2)
+## 1. Purpose
+
+C3 is a multi-tenant command-and-control dashboard for OpenClaw orgs. It lets an operator see all the AI agents in their org, the tasks being routed between them, the audit log of inter-agent messages, and the operational state of the OpenClaw infrastructure.
+
+Each org's data is private to that org. The dashboard is a single web app, served from one place, talking to a single public API, which talks to per-org add-ons running inside each customer's network.
+
+---
+
+## 2. The three layers
 
 ```
-                            ┌─────────────────────────────────┐
-                            │  Vercel (Edge + Serverless)     │
-                            │  ┌───────────────────────────┐  │
-                            │  │  c3.blackrabbitgroup.org  │  │
-                            │  │  ud4090v/c3 (Public UI)   │  │
-                            │  │  Vite + React SPA         │  │
-                            │  └─────────────┬─────────────┘  │
-                            │                │ /api/* (rewrite)
-                            │  ┌─────────────▼─────────────┐  │
-                            │  │  Public API (Phase 2)     │  │
-                            │  │  ud4090v/c3-api (TBD)     │  │
-                            │  │  Stateless multi-tenant   │  │
-                            │  └─────────────┬─────────────┘  │
-                            └────────────────┼────────────────┘
-                                             │ HTTPS + per-org API key (X-C3-Org-Id + HMAC)
-                                             ▼
-                            ┌─────────────────────────────────┐
-                            │  SAXA box (or any OpenClaw box)│
-                            │  ┌───────────────────────────┐  │
-                            │  │  OpenClaw add-on          │  │
-                            │  │  ud4090v/openclaw-c3-addon│  │
-                            │  │  @openclaw/c3-addon       │  │
-                            │  │  HMAC-verifying HTTP      │  │
-                            │  │  on 127.0.0.1:52400       │  │
-                            │  └─────────────┬─────────────┘  │
-                            │                │ CLI + vault
-                            │  ┌─────────────▼─────────────┐  │
-                            │  │  OpenClaw CLI             │  │
-                            │  │  + agent sessions         │  │
-                            │  │  + vault + wiki           │  │
-                            │  └───────────────────────────┘  │
-                            └─────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  LAYER 1 — PUBLIC UI                                                      │
+│                                                                          │
+│  Repo:    ud4090v/c3                                                     │
+│  Runtime: Vercel (static SPA, Vite + React + React Query + Socket.IO    │
+│           client — Socket.IO is wired but unused in v1, see §6)          │
+│  URL:     https://c3.blackrabbitgroup.org                                │
+│  Domain:  Apex blackrabbitgroup.org (DNS at Google Cloud DNS)            │
+│  Vercel:  project openclaw-c3, BlackRabbitDev team                       │
+│  Source:  https://github.com/ud4090v/c3                                  │
+│                                                                          │
+│  Invariants:                                                             │
+│  - Static only. No backend in this repo.                                  │
+│  - All API calls go to relative paths under `/api/*` (same-origin).      │
+│  - The browser never sees absolute URLs to the API or to add-ons.        │
+│  - Bundle is rebuilt and redeployed by Vercel on every push to main.     │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                   │ HTTPS, same-origin via Vercel rewrite
+                                   │ (no CORS, no preflight)
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  LAYER 2 — PUBLIC API                                                     │
+│                                                                          │
+│  Repo:    ud4090v/c3-api   (BUILT IN PHASE 2 of C3-56)                   │
+│  Runtime: Vercel serverless functions (Node.js, @vercel/node)            │
+│  URL:     https://c3-api.vercel.app (default Vercel hostname)            │
+│           rewrite target from ud4090v/c3/vercel.json                     │
+│  Source:  https://github.com/ud4090v/c3-api                              │
+│                                                                          │
+│  Invariants:                                                             │
+│  - Stateless. NO persistent storage of customer data in this layer.      │
+│  - Per-org API key auth (HMAC-SHA256 signed requests), key shape:        │
+│      c3k_live_<32-char-base62>  |  c3k_test_<32-char-base62>             │
+│  - Acts as a router + transformer: receives browser request, signs a     │
+│    request to the customer's add-on, returns the add-on's response.      │
+│  - Reads no org data directly. All facts about an org come from the      │
+│    org's own add-on.                                                     │
+│  - Multi-tenant from day one (ADR-C3-002). Per-org rate limiting lives   │
+│    here (sliding window keyed by org_id from the API key).               │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                   │ HTTPS, HMAC-signed requests
+                                   │ (per-org API key from public API layer)
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│  LAYER 3 — OPENCLAW ADD-ON                                               │
+│                                                                          │
+│  Repo:    ud4090v/openclaw-c3-addon                                       │
+│  Runtime: Node.js, Fastify, loopback-only bind                           │
+│  Bind:    127.0.0.1:52400 (no public DNS, no public port)                │
+│  Source:  https://github.com/ud4090v/openclaw-c3-addon                   │
+│  Reachable via:  Cloudflare Tunnel → add-on.blckrbbt.io                  │
+│                                                                          │
+│  Invariants:                                                             │
+│  - Listens on loopback ONLY. Never bound to a public interface.          │
+│  - Customer data lives here (SQLite at ~/.openclaw/c3-addon/data/).      │
+│  - Verifies HMAC signature on every incoming request. Constant-time     │
+│    comparison, timestamp window ±5 min, nonce cache for replay defense.  │
+│  - Wraps the OpenClaw CLI (`openclaw sessions`, `openclaw agent`, etc.)  │
+│    and exposes them as REST endpoints under /openclaw/*.                 │
+│  - Falls back to mock data ONLY when the OpenClaw service is genuinely    │
+│    unreachable (not on auth errors or transient blips). Tracks fallback  │
+│    state and surfaces it at /openclaw/sync-status for the dashboard.     │
+│  - One add-on per org. Public API knows how to reach each org's add-on   │
+│    from the org_id embedded in the API key signature.                    │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Trust model:**
-- **Public UI ↔ Public API:** same-origin via Vercel rewrites. Browser never sees the API key.
-- **Public API ↔ add-on:** mTLS or HMAC over HTTPS (TBD Phase 2). Per-org API key in `X-C3-Org-Id` header.
-- **Add-on ↔ OpenClaw:** loopback trust. Same box. Port 52400 binds to `127.0.0.1` only.
+**Why three layers, not two:** the customer-data-locality requirement (compliance, data residency) means the public API cannot hold customer data. The add-on keeps data on the customer's box. The public API is pure router logic that can be deployed once and serve many orgs.
+
+**Why not CORS:** the SPA and the public API share the same origin (Vercel rewrites `/api/*` from the SPA domain to the API domain transparently). The browser never sees the API as a separate origin, so no CORS preflight, no credentialed requests, no `withCredentials` plumbing. The add-on is never reachable from the browser — only from the public API.
 
 ---
 
-## The Three Repos (post-split, 2026-06-29)
+## 3. Wire-level contracts
 
-| Repo | Purpose | Stack | Build target |
-|---|---|---|---|
-| **`ud4090v/c3`** | Public UI (this SPA) | Vite + React 18 + TypeScript + Tailwind + TanStack Query + Zustand + Socket.IO client + react-router | Vercel static |
-| `ud4090v/c3-api` | Public API (Phase 2 of C3-56) | TBD — likely Fastify or Hono on Vercel Serverless | Vercel Serverless |
-| `ud4090v/openclaw-c3-addon` | OpenClaw add-on | Fastify + pino + TypeScript ESM. Wraps OpenClaw CLI over HMAC-signed HTTP | Loopback only, per-box npm install |
+### 3.1 SPA → Public API (browser → Vercel rewrite → public API)
 
-The mono-repo `ud4090v/openclaw-c3` is **archived**. Its 6 commits (2026-06-25) represent the development history of the add-on and SPA together; that history is preserved.
+Same-origin. The SPA uses relative `/api/*` paths. Vercel rewrite in `ud4090v/c3/vercel.json` proxies `/api/:path*` to `https://c3-api.vercel.app/:path*` server-side. Browser doesn't know.
+
+### 3.2 Public API → Add-on (server → server, cross-trust-boundary)
+
+Every request is HMAC-signed. Headers required:
+
+| Header           | Value                                                          |
+|------------------|----------------------------------------------------------------|
+| `X-C3-Org-Id`    | org identifier (matches the API key's bound org)               |
+| `X-C3-Timestamp` | unix seconds, integer string                                   |
+| `X-C3-Nonce`     | 16 random bytes, hex (32 chars)                                |
+| `X-C3-Signature` | hex HMAC-SHA256                                               |
+
+String-to-sign: `METHOD\nPATH\nTIMESTAMP\nNONCE\nsha256(body)-hex`. HMAC key: base64-decoded `api_secret` from the add-on's `~/.openclaw/c3-addon/config.json`. Constant-time comparison. Timestamp tolerance: ±300s. Nonce cache TTL: 10 min (replay protection).
+
+### 3.3 Add-on → OpenClaw CLI
+
+The add-on shells out to `openclaw sessions --json`, `openclaw agent --session-key <key> -m <message> --json`, and `openclaw config get agents.list --json`. The CLI is the authoritative source of agent / session state. Mock fallback only when CLI is genuinely unreachable (ENOENT, ECONNREFUSED, command-not-found).
 
 ---
 
-## Public UI (`ud4090v/c3`) — Internal Layout
+## 4. Trust boundaries
+
+- **Internet ↔ Public UI**: TLS, public. No auth on the SPA itself (public product). All auth happens at the public API.
+- **SPA ↔ Public API**: same-origin via Vercel rewrite. Public API authenticates via per-org API key carried in `X-C3-*` headers by the SPA (server-side, not by the browser).
+- **Public API ↔ Add-on**: HMAC-signed. The public API holds the org's API key; the add-on holds the corresponding secret. Neither side is publicly reachable except through Vercel or the Cloudflare Tunnel.
+- **Add-on ↔ OpenClaw**: same-box, same-user process. Trust by co-location.
+
+**Out of scope for v1:**
+- Mutual TLS between public API and add-on. HMAC alone is sufficient given the tunnel-only network path; can be added if/when the tunnel becomes unreliable.
+- Browser-to-public-API auth. The SPA is the public-facing surface; auth at the API layer is per-org (operator-level), not per-user.
+
+---
+
+## 5. Data ownership
+
+| Data class             | Owner       | Storage                                              |
+|------------------------|-------------|------------------------------------------------------|
+| Agent roster, status   | Add-on      | SQLite at `~/.openclaw/c3-addon/data/c3.db` + live CLI queries |
+| Task history           | Add-on      | SQLite, same DB                                      |
+| Audit log              | Add-on      | SQLite, same DB                                      |
+| Notifications          | Add-on      | SQLite, same DB                                      |
+| API keys, org_id table | Public API  | Vercel KV or Postgres (Phase 6 — single-org at launch) |
+| Vault (.md files)      | Add-on      | Read-only fs at `~/.openclaw/vault/`                 |
+
+**Critical invariant:** the public API never writes customer data. It only routes.
+
+**At launch (Phase 2 of C3-56):** single-org mode. The only org is the BRG org itself. The public API has one hardcoded API key, the add-on has its matching secret. Multi-tenant scaffolding is in place but the org-creation flow is not built until Phase 6.
+
+---
+
+## 6. Real-time updates
+
+**v1:** polling. React Query `refetchInterval: 10000` (10s) on the SPA. Socket.IO client code is wired (`src/hooks/useRealtimeUpdates.ts`) but disabled. ADR-C3-004: deferred.
+
+**Rationale:** Vercel serverless functions can't hold long-lived WebSocket connections. Adding Socket.IO means a separate persistent service (Pusher, Ably, Fly.io). For a control plane, 10s staleness is acceptable.
+
+---
+
+## 7. Repository map
+
+| Layer | Repo                              | Purpose                                 | Status        |
+|-------|-----------------------------------|-----------------------------------------|---------------|
+| 1     | `ud4090v/c3`                      | Public UI (Vite + React)                | ✅ Live       |
+| 2     | `ud4090v/c3-api`                  | Public API (Express on Vercel)          | ⏳ Phase 2    |
+| 3     | `ud4090v/openclaw-c3-addon`        | OpenClaw add-on (Fastify, loopback)     | ✅ Built, ⏳ redeploy |
+| —     | `ud4090v/openclaw-c3` (archived)  | Legacy mono-repo, history preserved     | 📦 Archived   |
+
+---
+
+## 8. Infrastructure map
+
+| Component                | Where                          | URL                                              |
+|--------------------------|--------------------------------|--------------------------------------------------|
+| Public UI                | Vercel                         | https://c3.blackrabbitgroup.org                  |
+| Public API               | Vercel (serverless functions)  | https://c3-api.vercel.app                        |
+| Add-on (BRG org)         | SAXA box, 127.0.0.1:52400      | via tunnel → https://add-on.blckrbbt.io          |
+| OpenClaw CLI             | SAXA box, same-user            | (local, not network-reachable)                   |
+| DNS (apex)               | Google Cloud DNS               | blackrabbitgroup.org                             |
+| DNS (sub)                | Google Cloud DNS               | c3.blackrabbitgroup.org → Vercel anycast         |
+| Tunnel                   | Cloudflare Tunnel on SAXA      | add-on.blckrbbt.io → 127.0.0.1:52400             |
+
+---
+
+## 9. Deployment topology per layer
+
+### Layer 1 — Public UI (`ud4090v/c3`)
 
 ```
-ud4090v/c3/
-├── index.html                  # Vite entry
-├── package.json                # root package, scripts: dev/build/preview/test
-├── pnpm-workspace.yaml         # workspace = ['.', 'packages/*']
-├── tsconfig.json               # path alias @c3/shared → ./packages/shared/src
-├── vite.config.ts
-├── tailwind.config.js
-├── postcss.config.js
-├── public/                     # static assets served as-is
-│   └── favicon.svg
-├── src/
-│   ├── main.tsx                # ReactDOM.createRoot mount point
-│   ├── App.tsx                 # router + global providers (QueryClient, Zustand store)
-│   ├── index.css               # Tailwind directives + custom CSS vars
-│   ├── lib/
-│   │   └── api.ts              # typed fetchJson wrapper + api.* facade
-│   ├── hooks/
-│   │   └── useRealtimeUpdates.ts  # Socket.IO subscription for live data
-│   ├── components/
-│   │   ├── AgentDirectory.tsx
-│   │   ├── AgentDetail.tsx
-│   │   ├── TaskBoard.tsx
-│   │   ├── CreateTaskForm.tsx
-│   │   ├── OrgChart.tsx
-│   │   ├── AuditLog.tsx
-│   │   ├── NotificationBell.tsx
-│   │   ├── Analytics.tsx
-│   │   ├── DataFreshness.tsx
-│   │   ├── HealthBar.tsx
-│   │   ├── VaultBrowser.tsx
-│   │   └── StatusBadge.tsx
-│   └── (no src/shared/ — moved to packages/shared/src/)
-└── packages/
-    └── shared/
-        ├── package.json        # @c3/shared, type: module, main: ./src/index.ts
-        ├── tsconfig.json
-        └── src/
-            └── index.ts        # 162 lines — Agent, Task, Audit, Notification,
-                                #   OrgChart, Analytics, Health types
+Push to main on GitHub
+   ↓
+Vercel auto-detects framework (vite)
+   ↓
+pnpm install && pnpm build  (in Vercel build env)
+   ↓
+Outputs to dist/
+   ↓
+Vercel CDN serves dist/ at the project's assigned hostnames
+   ↓
+vercel.json rewrites /api/* to c3-api.vercel.app
 ```
 
-### Data flow
+**No runtime state. Zero persistent volumes. Free tier fine for v1.**
 
-1. **Components** call the typed `api.*` facade in `src/lib/api.ts`.
-2. `api.*` calls `fetchJson('/path')` which prepends `API_BASE = '/api'`.
-3. Vercel rewrites `/api/*` → `https://api.blckrbbt.io/{same-path}` (today) OR `https://c3-api.vercel.app/{same-path}` (Phase 2 of C3-56).
-4. Public API verifies per-org HMAC, then proxies to the per-box add-on over loopback / tunnel.
-5. Add-on verifies inbound HMAC, executes the OpenClaw CLI call, returns typed JSON.
-6. TanStack Query handles caching, invalidation, retries on the client.
-7. Socket.IO subscription (`useRealtimeUpdates`) gets pushed events from the API for live updates without polling.
-
-### Why these specific choices
-
-| Choice | Why |
-|---|---|
-| **Vite + React 18 + TS** | Fast dev loop, mature ecosystem, Vercel-native build target. |
-| **TanStack Query** | Handles server-state caching, dedup, retries, invalidation — vastly simpler than Redux for this use case. |
-| **Zustand** | Lightweight client-state for UI-only state (sidebar collapsed, current filter). No provider hell. |
-| **Socket.IO client** | Real-time push from API. Falls back to polling if socket disconnects. |
-| **`@c3/shared` in-repo** | Single source of truth for types, no publishing to npm, no version drift between client and server. |
-| **Tailwind** | Utility-first. Fast to iterate on the dashboards/tables. |
-| **`API_BASE = '/api'`** | Same-origin via Vercel rewrites — browser never needs to know the API host. |
-
----
-
-## Add-on (`ud4090v/openclaw-c3-addon`) — Internal Layout
+### Layer 2 — Public API (`ud4090v/c3-api`)
 
 ```
-ud4090v/openclaw-c3-addon/
-├── package.json        # @openclaw/c3-addon, type: module, bin: c3-addon
-├── tsconfig.json
-├── README.md           # migration notes + Phase 1-4 commit history
-└── src/
-    ├── index.ts        # bootstrap
-    ├── server.ts       # Fastify app, routes registered, CORS locked
-    ├── config.ts       # reads C3_ADDON_SECRET_FILE, org_id, port
-    ├── adapter.ts      # OpenClaw CLI invocation + response shaping
-    ├── auth/           # HMAC verify/sign helpers
-    ├── routes/         # /openclaw/agents, /openclaw/config, /openclaw/messages, etc.
-    └── types.ts        # addon-side request/response types
+Push to main on GitHub
+   ↓
+Vercel auto-detects (no framework — pure Node serverless)
+   ↓
+api/*.ts compiled to serverless functions
+   ↓
+Each /api/* path is a serverless function (10s timeout on hobby, 60s on pro)
+   ↓
+Function runtime: Node 22, fetch to add-on via HMAC
+   ↓
+Vercel CDN in front, function cold-start ~50-500ms
 ```
 
-### Trust model (loopback + HMAC)
+**No persistent volumes. API key table lives in Vercel KV (single entry at launch).** When tenant count > 1, migrate to Vercel Postgres.
 
-- Listens on `127.0.0.1:52400` ONLY. No public port. No DNS record needed.
-- Inbound requests: HMAC-SHA256 over the request body + canonical headers, signed with `C3_ADDON_SECRET`. Verified against the same shared secret on both sides.
-- Outbound to OpenClaw CLI: subprocess invocation, return stdout parsed as JSON.
-- No persistent state. Every request is a fresh CLI call.
-- The secret lives in `/root/.openclaw/c3-addon/server-secret` on the box, loaded via `C3_ADDON_SECRET_FILE` env var on the **caller** (c3-server.service) — never logged, never sent in plaintext.
+### Layer 3 — Add-on (`ud4090v/openclaw-c3-addon`)
 
----
+```
+Git clone on SAXA box (or `npm install -g` for the public release)
+   ↓
+pnpm install && pnpm build
+   ↓
+Generate ~/.openclaw/c3-addon/config.json with org_id, api_key, api_secret, bind_host=127.0.0.1, bind_port=52400, openclaw_cli_path
+   ↓
+Systemd unit: c3-addon.service (after=network.target, restart=always)
+   ↓
+Cloudflare Tunnel: cloudflared service, ingress rule add-on.blckrbbt.io → 127.0.0.1:52400
+   ↓
+Public API has the matching api_key in its config
+```
 
-## Phase Plan & Status (C3-55)
+**Persistent state: SQLite at `~/.openclaw/c3-addon/data/c3.db`. Schema is `packages/server/src/db/` from the legacy c3-server, lifted verbatim — tables for agents, tasks, audit_messages, notifications, api_keys.**
 
-| Phase | What | Status |
-|---|---|---|
-| A | `ud4090v/c3` builds clean from a fresh clone | ✅ Done 2026-06-29 (commit `a0c360e`) |
-| B | Create Vercel project linked to `ud4090v/c3`, configure build + env | ⏳ Next |
-| C | Configure Vercel rewrites `/api/*` → `https://api.blckrbbt.io` (today) or Phase 2 API | Pending |
-| D | Promote Vercel deployment; point `c3.blackrabbitgroup.org` (or chosen domain) at it | Pending |
-| E | Tear down `:3002/:3004` + `c3-client.service` at same moment as Vercel promotion. **No rollback seatbelt.** | Pending |
-
-## Phase Plan & Status (C3-56 — Phase 2 of productization)
-
-| Phase | What | Status |
-|---|---|---|
-| 1 | Decide runtime: Vercel Serverless vs separate Node service on Fly.io/Railway | Open |
-| 2 | Design `ud4090v/c3-api` repo skeleton (Fastify or Hono, OpenAPI spec, per-org auth middleware) | Open |
-| 3 | Migrate `c3-server.service` Express logic into the new repo (drop mono-repo patterns) | Open |
-| 4 | Wire SPA to public API; cut Vercel rewrite target from `api.blckrbbt.io` → Vercel API | Open |
-| 5 | Decommission SAXA-side `c3-server.service`; only `c3-addon.service` remains on the box | Open |
+**No public port. Tunnel-only. Reachable from anywhere but HMAC-gated.**
 
 ---
 
-## Open Decisions Surfaced (C3-55 cleanup #2, 2026-06-29 09:05 EDT)
+## 10. Phased delivery status
 
-1. **GitHub repo name** — `ud4090v/c3` (current). Alternative: `ud4090v/c3-public-ui`. Decision: keep `ud4090v/c3` short.
-2. **Vercel project name** — TBD. Default suggestion: `c3-public-ui` matching the eventual Phase 2 naming.
-3. **Custom domain** — TBD. `c3.blackrabbitgroup.org` is the working assumption. Confirm with Cormac before D.
-4. **C1 vs wait-for-C2** — C1 = Vercel rewrite `/api/*` → `api.blckrbbt.io` (today, calls SAXA via tunnel). C2 = Vercel rewrite → Vercel-side public API (Phase 2 of C3-56). Recommend C1 for D, swap to C2 when c3-api is ready.
-5. **API key model** — Per-org `X-C3-Org-Id` header + HMAC body signature. Keys generated server-side, customer-issued. No cookie auth. No JWT.
+From C3-56's plan:
+
+| Phase | What                                                            | Status      |
+|-------|-----------------------------------------------------------------|-------------|
+| 1     | Add-on package skeleton                                         | ✅ Done (Phases 1-4 of the original addon build landed in `ud4090v/openclaw-c3-addon` before the archive) |
+| 2     | Run add-on on SAXA box + network reachability                  | ⏳ In progress (C3-56 Phase 2, this issue's scope) |
+| 3     | Public API on Vercel                                            | ⏳ Pending (this issue)         |
+| 4     | Wire SPA to public API (flip Vercel rewrite destination)       | ⏳ Pending (this issue)         |
+| 5     | Decommission legacy SAXA monolith                                | ✅ Done (Phase E of C3-55)      |
+| 6     | Productization (multi-tenant onboarding, billing, etc.)         | Out of scope for this issue     |
 
 ---
 
-## Quick Up-To-Speed (read this if you've lost context)
+## 11. Open decisions and their resolution
 
-1. **What we have:** three repos (`ud4090v/c3`, `ud4090v/openclaw-c3-addon`, future `ud4090v/c3-api`). Mono-repo is archived.
-2. **What's running today:** `c3-server.service` + `c3-addon.service` + `c3-client.service` on SAXA, all bound to loopback. Tunnel `c3-prod` (Cloudflare) exposes `api.blckrbbt.io` (c3-server) and `add-on.blckrbbt.io` (c3-addon). Done in SER-328.
-3. **What's next:** Phase B (Vercel project), then C (rewrites), then D (cutover), then E (teardown). No rollback seatbelt at E per Cormac.
-4. **Architectural invariants:**
-   - Public UI must talk to `/api/*` same-origin only. Never to absolute URLs.
-   - Loopback trust for add-on ↔ OpenClaw. Never expose 52400 publicly.
-   - HMAC body signing for any cross-trust-boundary call. Shared secret in `C3_ADDON_SECRET_FILE`.
-   - `@c3/shared` is the only shared code between UI and API. In-repo for now. Single source of truth.
-5. **Where to look in Plane:** C3 project → issues C3-52, C3-54, C3-55, C3-56. SER-328 in infrastructure workspace for the networking baseline.
-6. **Lessons learned:**
-   - `memory/lessons/2026-06-29-c3-55-56-cancel-prematurely.md` — don't cancel sibling issues without verifying the staged-pair relationship first.
-   - `memory/lessons/2026-06-25-c3-trust-boundary-auth-architecture.md` — loopback trust is the right primitive for the add-on; revisit only when topology changes.
-   - Don't quote memory files for "Plane facts." Always query Plane.
+| Question                                            | Decision                                                  |
+|-----------------------------------------------------|-----------------------------------------------------------|
+| Network reachability (add-on ↔ public API)          | Cloudflare Tunnel. `add-on.blckrbbt.io → 127.0.0.1:52400`. |
+| Where does customer data live?                      | SQLite in the add-on, at `~/.openclaw/c3-addon/data/`.    |
+| Public API auth                                     | Per-org API key (HMAC-SHA256), single org at launch.      |
+| Multi-tenant at launch?                             | No. Single-org (BRG) only. Tenant table schema in code but only one row at launch. |
+| Polling vs Socket.IO                                | Polling at 10s. Socket.IO client wired but disabled.      |
+| Where to host the public API                        | Vercel serverless functions (same account as UI).         |
+| Migration path if Vercel changes pricing?           | Re-deploy to Fly.io or Render. API code is portable Express. |
+| What happens to the legacy `api.blckrbbt.io` tunnel after this issue lands? | Decommissioned. Public API becomes the new termination point. Tunnel to SAXA becomes the add-on-only tunnel (`add-on.blckrbbt.io`). |
+| What about the `c3.blckrbbt.io` domain (public API, per Cormac) | Separate surface, future use. Out of scope here. |
+
+---
+
+## 12. What this document is NOT
+
+- Not a runbook. Runbooks live in `memory/YYYY-MM-DD-*-runbook.md` per session.
+- Not an ADR log. ADRs are inline §11-style decisions for now; graduate to a separate log when one of them gets reversed.
+- Not a deployment manifest. Vercel project settings, DNS records, Cloudflare Tunnel config are tracked in Plane issues, not here.
+- Not exhaustive. New questions get a row in §11, not a section rewrite. Update §2-9 only when the architecture itself changes.
+
+---
+
+**Last updated:** 2026-06-29 — Mauzz, after Cormac clarified the three-layer design intent.
